@@ -269,6 +269,47 @@ func (mgtr *Migrator) canStopStreaming() bool {
 	return atomic.LoadInt64(&mgtr.migrationContext.CutOverCompleteFlag) != 0
 }
 
+// ghostTableMigratedStatusInterval is how often waitForGhostTableMigrated logs while it waits.
+var ghostTableMigratedStatusInterval = 10 * time.Second
+
+// waitForGhostTableMigrated blocks until the GhostTableMigrated changelog state, written on the
+// applier, is read back through the binlog stream from the inspected server. That can take a
+// long time if the inspected server is a lagging or delayed replica, so log progress periodically.
+func (mgtr *Migrator) waitForGhostTableMigrated() error {
+	logStatus := func() {
+		lag, err := mgtr.inspector.getReplicationLag()
+		lagStr := lag.String()
+		if err != nil {
+			lagStr = fmt.Sprintf("unknown (%s)", err)
+		}
+		mgtr.migrationContext.Log.Infof(
+			"Waiting for ghost table to be migrated: waiting for changelog state %s, written on applier %s, to arrive via binlog stream from %s. Replication lag on %s: %s; streamer at %s; waited %s",
+			GhostTableMigrated,
+			mgtr.migrationContext.ApplierConnectionConfig.Key.String(),
+			mgtr.migrationContext.InspectorConnectionConfig.Key.String(),
+			mgtr.migrationContext.InspectorConnectionConfig.Key.String(),
+			lagStr,
+			mgtr.eventsStreamer.GetCurrentBinlogCoordinates().DisplayString(),
+			time.Since(mgtr.migrationContext.StartTime).Round(time.Second),
+		)
+	}
+	logStatus()
+
+	ticker := time.NewTicker(ghostTableMigratedStatusInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-mgtr.ghostTableMigrated:
+			mgtr.migrationContext.Log.Infof("Ghost table migrated")
+			return nil
+		case <-ticker.C:
+			logStatus()
+		case <-mgtr.migrationContext.GetContext().Done():
+			return mgtr.migrationContext.GetContext().Err()
+		}
+	}
+}
+
 // onChangelogEvent is called when a binlog event operation on the changelog table is intercepted.
 func (mgtr *Migrator) onChangelogEvent(dmlEntry *binlog.BinlogEntry) (err error) {
 	// Hey, I created the changelog table, I know the type of columns it has!
@@ -549,11 +590,10 @@ func (mgtr *Migrator) Migrate() (err error) {
 		}
 	}
 
-	initialLag, _ := mgtr.inspector.getReplicationLag()
 	if !mgtr.migrationContext.Resume {
-		mgtr.migrationContext.Log.Infof("Waiting for ghost table to be migrated. Current lag is %+v", initialLag)
-		<-mgtr.ghostTableMigrated
-		mgtr.migrationContext.Log.Debugf("ghost table migrated")
+		if err := mgtr.waitForGhostTableMigrated(); err != nil {
+			return err
+		}
 	}
 	// Yay! We now know the Ghost and Changelog tables are good to examine!
 	// When running on replica, this means the replica has those tables. When running
