@@ -69,6 +69,7 @@ func NewGoMySQLReader(migrationContext *base.MigrationContext, rowsEventFilters 
 		UseDecimal:              true,
 		TimestampStringLocation: time.UTC,
 		MaxReconnectAttempts:    migrationContext.BinlogSyncerMaxReconnectAttempts,
+		Dialer:                  mysql.DialContext,
 	}
 	config.RowsEventDecodeFunc = newRowsEventDecodeFunc(rowsEventFilter)
 	return &GoMySQLReader{
