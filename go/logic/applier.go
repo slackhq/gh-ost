@@ -90,6 +90,7 @@ type Applier struct {
 	migrationLockConn *gosql.Conn
 	migrationLockDB   *gosql.DB
 	migrationLockName string
+	migrationLockAddr *mysql.ConnAddrs
 	migrationLockStop chan struct{}
 	migrationLockDone chan struct{}
 }
@@ -181,17 +182,18 @@ func (apl *Applier) AcquireMigrationLock(ctx context.Context) error {
 	lockDB.SetMaxOpenConns(1)
 	lockDB.SetMaxIdleConns(1)
 
-	conn, err := lockDB.Conn(ctx)
+	dialCtx, lockAddr := mysql.WithConnAddrs(ctx)
+	conn, err := lockDB.Conn(dialCtx)
 	if err != nil {
 		lockDB.Close()
-		return fmt.Errorf("failed to obtain pinned connection for migration lock: %w", err)
+		return fmt.Errorf("failed to obtain pinned connection for migration lock to %s: %w", apl.connectionConfig.Key.StringCode(), err)
 	}
 
 	var lockResult gosql.NullInt64
 	if err := conn.QueryRowContext(ctx, `select /* gh-ost */ get_lock(?, 0)`, lockName).Scan(&lockResult); err != nil {
 		conn.Close()
 		lockDB.Close()
-		return fmt.Errorf("failed to execute GET_LOCK for migration lock %s: %w", lockName, err)
+		return fmt.Errorf("failed to execute GET_LOCK for migration lock %s on connection %s: %w", lockName, lockAddr, err)
 	}
 
 	if !lockResult.Valid {
@@ -216,10 +218,11 @@ func (apl *Applier) AcquireMigrationLock(ctx context.Context) error {
 	apl.migrationLockConn = conn
 	apl.migrationLockDB = lockDB
 	apl.migrationLockName = lockName
+	apl.migrationLockAddr = lockAddr
 	apl.migrationLockStop = make(chan struct{})
 	apl.migrationLockDone = make(chan struct{})
 	go apl.keepMigrationLockAlive(ctx)
-	apl.migrationContext.Log.Infof("Acquired migration lock %s", lockName)
+	apl.migrationContext.Log.Infof("Acquired migration lock %s on connection %s", lockName, lockAddr)
 	return nil
 }
 
@@ -249,7 +252,7 @@ func (apl *Applier) keepMigrationLockAlive(ctx context.Context) {
 				return
 			}
 			_ = base.SendWithContext(ctx, apl.migrationContext.PanicAbort,
-				fmt.Errorf("migration lock %s connection lost: %w", apl.migrationLockName, err))
+				fmt.Errorf("migration lock %s connection %s lost: %w", apl.migrationLockName, apl.migrationLockAddr, err))
 			return
 		}
 	}
@@ -285,10 +288,10 @@ func (apl *Applier) releaseMigrationLock() {
 	releaseCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := apl.migrationLockConn.ExecContext(releaseCtx, `select /* gh-ost */ release_lock(?)`, apl.migrationLockName); err != nil {
-		apl.migrationContext.Log.Warningf("failed to release migration lock %s: %v", apl.migrationLockName, err)
+		apl.migrationContext.Log.Warningf("failed to release migration lock %s on connection %s: %v", apl.migrationLockName, apl.migrationLockAddr, err)
 	}
 	if err := apl.migrationLockConn.Close(); err != nil {
-		apl.migrationContext.Log.Warningf("failed to close migration lock connection: %v", err)
+		apl.migrationContext.Log.Warningf("failed to close migration lock connection %s: %v", apl.migrationLockAddr, err)
 	}
 	if apl.migrationLockDB != nil {
 		apl.migrationLockDB.Close()
