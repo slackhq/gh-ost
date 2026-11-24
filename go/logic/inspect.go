@@ -686,6 +686,12 @@ func (isp *Inspector) CountTableRows(ctx context.Context) error {
 			isp.migrationContext.Log.Infof("exact row count cancelled (%s), likely because I'm about to cut over. I'm going to kill that query.", ctx.Err())
 			return mysql.Kill(isp.db, connectionID)
 		}
+		// Any other failure (e.g. a client-side readTimeout from --mysql-timeout)
+		// only drops our end of the connection: mysqld keeps scanning until it
+		// tries to send the result. Kill it so the expensive COUNT(*) stops.
+		if killErr := mysql.Kill(isp.db, connectionID); killErr != nil {
+			isp.migrationContext.Log.Warningf("failed to kill exact row count query (connection %s): %v", connectionID, killErr)
+		}
 		return err
 	}
 	metrics.RecordQueryDuration(isp.migrationContext.Metrics, "source", "row_count", time.Since(queryStartTime), nil)

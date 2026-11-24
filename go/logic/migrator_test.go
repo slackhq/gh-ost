@@ -378,28 +378,33 @@ func TestMigratorGetMigrationStateAndETA(t *testing.T) {
 		require.Equal(t, "20m30s", etaDuration.String())
 	}
 	{
+		// estimate reached but row copy not complete: remaining work unknown
 		migrationContext.TotalRowsCopied = 456
 		state, eta, etaDuration := migrator.getMigrationStateAndETA(456)
 		require.Equal(t, "migrating", state)
-		require.Equal(t, "due", eta)
-		require.Equal(t, "0s", etaDuration.String())
+		require.Equal(t, "N/A", eta)
+		require.Equal(t, time.Duration(base.ETAUnknown), etaDuration)
 	}
 	{
+		// copied far more than estimated, row copy not complete, no usable
+		// unique key: the remaining work is unknown, so not "due"
 		migrationContext.TotalRowsCopied = 123456
 		state, eta, etaDuration := migrator.getMigrationStateAndETA(456)
 		require.Equal(t, "migrating", state)
-		require.Equal(t, "due", eta)
-		require.Equal(t, "0s", etaDuration.String())
+		require.Equal(t, "N/A", eta)
+		require.Equal(t, time.Duration(base.ETAUnknown), etaDuration)
 	}
 	{
 		atomic.StoreInt64(&migrationContext.CountingRowsFlag, 1)
 		state, eta, etaDuration := migrator.getMigrationStateAndETA(123456)
 		require.Equal(t, "counting rows", state)
-		require.Equal(t, "due", eta)
-		require.Equal(t, "0s", etaDuration.String())
+		require.Equal(t, "N/A", eta)
+		require.Equal(t, time.Duration(base.ETAUnknown), etaDuration)
 	}
 	{
 		atomic.StoreInt64(&migrationContext.CountingRowsFlag, 0)
+		// cut-over is only postponed once row copy has completed
+		atomic.StoreInt64(&migrator.rowCopyCompleteFlag, 1)
 		atomic.StoreInt64(&migrationContext.IsPostponingCutOver, 1)
 		state, eta, etaDuration := migrator.getMigrationStateAndETA(123456)
 		require.Equal(t, "postponing cut-over", state)

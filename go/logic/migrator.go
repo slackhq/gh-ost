@@ -470,9 +470,14 @@ func (mgtr *Migrator) countTableRows() (err error) {
 		mgtr.migrationContext.SetCountTableRowsCancelFunc(rowCountCancel)
 
 		mgtr.migrationContext.Log.Infof("As instructed, counting rows in the background; meanwhile I will use an estimated count, and will update it later on")
-		go countRowsFunc(rowCountContext)
-
-		// and we ignore errors, because this turns to be a background job
+		go func() {
+			// a background count failure is not fatal: we keep using the estimate,
+			// but say so, since progress/ETA then depend on that estimate
+			if err := countRowsFunc(rowCountContext); err != nil && rowCountContext.Err() == nil {
+				mgtr.migrationContext.Log.Warningf("exact row count failed, continuing with estimated row count %d: %v",
+					atomic.LoadInt64(&mgtr.migrationContext.RowsEstimate), err)
+			}
+		}()
 		return nil
 	}
 	return countRowsFunc(context.Background())
@@ -1388,20 +1393,29 @@ func (mgtr *Migrator) printMigrationStatusHint(writers ...io.Writer) {
 }
 
 // getProgressPercent returns an estimate of migration progess as a percent.
+// It never reports 100% or more while row copy is still running; see
+// getProgressPercentAndBasis.
 func (mgtr *Migrator) getProgressPercent(rowsEstimate int64) (progressPct float64) {
-	progressPct = 100.0
-	if rowsEstimate > 0 {
-		progressPct *= float64(mgtr.migrationContext.GetTotalRowsCopied()) / float64(rowsEstimate)
-	}
+	progressPct, _ = mgtr.getProgressPercentAndBasis(rowsEstimate)
 	return progressPct
 }
 
 // getMigrationETA returns the estimated duration of the migration
 func (mgtr *Migrator) getMigrationETA(rowsEstimate int64) (eta string, duration time.Duration) {
 	duration = time.Duration(base.ETAUnknown)
-	progressPct := mgtr.getProgressPercent(rowsEstimate)
+	progressPct, basis := mgtr.getProgressPercentAndBasis(rowsEstimate)
 	if progressPct >= 100.0 {
 		duration = 0
+	} else if basis == progressCapped {
+		// the row estimate was exceeded and there is no other measure of
+		// remaining work: we genuinely don't know, so don't claim "due"
+	} else if basis == progressByKeyRange {
+		if progressPct >= 0.1 {
+			// extrapolate from the share of the key range copied so far
+			elapsedRowCopySeconds := mgtr.migrationContext.ElapsedRowCopyTime().Seconds()
+			etaSeconds := elapsedRowCopySeconds * (100.0 - progressPct) / progressPct
+			duration = time.Duration(etaSeconds) * time.Second
+		}
 	} else if progressPct >= 0.1 {
 		totalRowsCopied := mgtr.migrationContext.GetTotalRowsCopied()
 		etaRowsPerSecond := atomic.LoadInt64(&mgtr.migrationContext.EtaRowsPerSecond)

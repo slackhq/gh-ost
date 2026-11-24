@@ -10,6 +10,7 @@ import (
 	gosql "database/sql"
 	"database/sql/driver"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -299,7 +300,13 @@ func GetTableColumns(db *gosql.DB, databaseName, tableName string) (*sql.ColumnL
 
 // Kill executes a KILL QUERY by connection id
 func Kill(db *gosql.DB, connectionID string) error {
-	_, err := db.Exec(`KILL QUERY %s`, connectionID)
+	// KILL does not take placeholders, so the id is formatted into the statement;
+	// parse it first so only a plain integer can ever reach the SQL text.
+	id, err := strconv.ParseUint(connectionID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid connection id %q: %w", connectionID, err)
+	}
+	_, err = db.Exec(fmt.Sprintf(`KILL QUERY %d`, id))
 	return err
 }
 
