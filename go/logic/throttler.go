@@ -184,6 +184,10 @@ func (thlr *Throttler) collectReplicationLag(firstThrottlingCollected chan<- boo
 	}
 }
 
+// controlReplicaErrorWarningInterval rate-limits the warning logged while a
+// throttle control replica cannot be read.
+const controlReplicaErrorWarningInterval = time.Minute
+
 // collectControlReplicasLag polls all the control replicas to get maximum lag value
 func (thlr *Throttler) collectControlReplicasLag() {
 	if atomic.LoadInt64(&thlr.migrationContext.HibernateUntil) > 0 {
@@ -245,12 +249,28 @@ func (thlr *Throttler) collectControlReplicasLag() {
 		return result
 	}
 
+	// An unreachable control replica throttles row copy AND binlog apply for
+	// as long as it stays unreachable (e.g. a replaced tablet), which otherwise
+	// only shows in the status line. Say so loudly, but not every 100ms.
+	var lastUnreachableWarning time.Time
+	warnUnreachableControlReplica := func(result *mysql.ReplicationLagResult) {
+		if result == nil || result.Err == nil || time.Since(lastUnreachableWarning) < controlReplicaErrorWarningInterval {
+			return
+		}
+		lastUnreachableWarning = time.Now()
+		thlr.migrationContext.Log.Warningf("throttling: cannot read lag from control replica %+v: %v. "+
+			"Migration is stalled until it is reachable or removed via the throttle-control-replicas interactive command",
+			result.Key, result.Err)
+	}
+
 	checkControlReplicasLag := func() {
 		if (thlr.migrationContext.TestOnReplica || thlr.migrationContext.MigrateOnReplica) && (atomic.LoadInt64(&thlr.migrationContext.AllEventsUpToLockProcessedInjectedFlag) > 0) {
 			// No need to read lag
 			return
 		}
-		thlr.migrationContext.SetControlReplicasLagResult(readControlReplicasLag())
+		result := readControlReplicasLag()
+		warnUnreachableControlReplica(result)
+		thlr.migrationContext.SetControlReplicasLagResult(result)
 	}
 
 	relaxedFactor := 10
